@@ -34,6 +34,7 @@ func (server *IpcServer) Connect() chan string {
 	session := make(chan string, 0)
 	go func(c chan string) {
 		for {
+			// 当客户端未发送请求时，协程在这里阻塞
 			request := <-c
 			if request == "CLOSE" {
 				break
@@ -55,5 +56,6 @@ func (server *IpcServer) Connect() chan string {
 		fmt.Println("session closed.")
 	}(session)
 	fmt.Println("A new session has been creted sucessful")
+	// 客户端第一次调用 Connect函数 时，协程阻塞，主线程从这里返回session
 	return session
 }

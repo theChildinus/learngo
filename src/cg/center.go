@@ -89,6 +89,7 @@ func (server *CenterServer) broadcast(params string) error {
 	defer server.mutex.Unlock()
 
 	if len(server.players) > 0 {
+		// 给每一个用户发送消息
 		for _, player := range server.players {
 			player.mq <- &message
 		}
