@@ -298,7 +298,9 @@ type conn struct {
 
 ### 处理请求
 
-在 `go c.serve(ctx)` 中，一个连接就是一个协程，`conn` 首先会解析 request，调用 `c.readRequest()`
+尽管 `go c.serve(ctx)` 很长，里面的结构和逻辑还是很清晰的，使用defer定义了函数退出时，连接关闭相关的处理。然后就是读取连接的网络数据 `c.readRequest()`，并处理读取完毕时候的状态 `c.setState(c.rwc, StateActive)`。
+
+接下来就是调用 `serverHandler{c.server}.ServeHTTP(w, w.req)` 方法处理请求了，最后就是请求处理完毕的逻辑。
 
 ```go
 // Serve a new connection.
@@ -354,7 +356,7 @@ func (c *conn) serve(ctx context.Context) {
     }
 ```
 
-`serverHandler` 定义如下：
+`serverHandler` 是一个重要的结构，它只有一个字段，即Server结构，同时它也实现了 `Handler` 接口方法ServeHTTP，并在该接口方法中做了一个重要的事情，初始化 `multiplexer` 路由多路复用器。如果server对象没有指定Handler，则使用默认的 `DefaultServeMux` 作为路由 `multiplexer`。并调用初始化Handler的ServeHTTP方法。
 
 ```go
 // serverHandler delegates to either the server's Handler or
@@ -373,10 +375,121 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 }
 ```
 
-然后获取相应的handler, 在 `serverHandler{c.server}.ServeHTTP(w, w.req)` 中有 `handler := c.server.Handler`，也就是我们刚才在调用函数 `ListenAndServe` 时候的第二个参数，我们前面例子传递的是 `nil`，也就是为空，那么默认获取 `handler = DefaultServeMux`，那么这个变量用来做什么的呢？这个变量就是一个路由器，它用来匹配 `url` 跳转到其相应的 `handle` 函数
+这里 `DefaultServeMux` 的ServeHTTP方法其实也是定义在ServeMux结构中的，相关代码如下：
 
-我们调用的代码里面第一句调用了 `http.HandleFunc("/", IndexHandler)`，这个作用就是注册了请求 `/` 的路由规则，当请求url为 `/`，路由就会转到函数 `IndexHandler`，`DefaultServeMux` 会调用ServeHTTP方法，这个方法内部其实就是调用 `IndexHandler` 本身，最后通过写入`response` 的信息反馈到客户端。
+```go
+// ServeHTTP dispatches the request to the handler whose
+// pattern most closely matches the request URL.
+func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+    if r.RequestURI == "*" {
+        if r.ProtoAtLeast(1, 1) {
+            w.Header().Set("Connection", "close")
+        }
+        w.WriteHeader(StatusBadRequest)
+        return
+    }
 
-`serverHandler{c.server}.ServeHTTP(w, w.req)` 运行结束后就是对请求处理完毕之后上希望和连接断开的相关逻辑
+    // ServeMux的ServeHTTP方法通过调用其Handler方法寻找注册到路由上的 `handler` 函数，本例是IndexHandler函数，并调用该函数的ServeHTTP方法
+    h, _ := mux.Handler(r)
+    h.ServeHTTP(w, r)
+}
+```
 
-至此，Golang中一个完整的http服务介绍完毕
+`ServeMux` 的 `Handler` 方法对URL简单的处理，然后调用 `handler` 方法，后者会创建一个锁，同时调用match方法返回一个 `handler` 和 `pattern`
+
+```go
+func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
+    // CONNECT requests are not canonicalized.
+    if r.Method == "CONNECT" {
+        // If r.URL.Path is /tree and its handler is not registered,
+        // the /tree -> /tree/ redirect applies to CONNECT requests
+        // but the path canonicalization does not.
+        if u, ok := mux.redirectToPathSlash(r.URL.Host, r.URL.Path, r.URL); ok {
+            return RedirectHandler(u.String(), StatusMovedPermanently), u.Path
+        }
+
+        return mux.handler(r.Host, r.URL.Path)
+    }
+
+    // All other requests have any port stripped and path cleaned
+    // before passing to mux.handler.
+    host := stripHostPort(r.Host)
+    path := cleanPath(r.URL.Path)
+
+    // If the given path is /tree and its handler is not registered,
+    // redirect for /tree/.
+    if u, ok := mux.redirectToPathSlash(host, path, r.URL); ok {
+        return RedirectHandler(u.String(), StatusMovedPermanently), u.Path
+    }
+
+    if path != r.URL.Path {
+        _, pattern = mux.handler(host, path)
+        url := *r.URL
+        url.Path = path
+        return RedirectHandler(url.String(), StatusMovedPermanently), pattern
+    }
+
+    return mux.handler(host, r.URL.Path)
+}
+```
+
+```go
+// handler is the main implementation of Handler.
+// The path is known to be in canonical form, except for CONNECT methods.
+func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
+    mux.mu.RLock()
+    defer mux.mu.RUnlock()
+
+    // Host-specific pattern takes precedence over generic ones
+    if mux.hosts {
+        h, pattern = mux.match(host + path)
+    }
+    if h == nil {
+        h, pattern = mux.match(path)
+    }
+    if h == nil {
+        h, pattern = NotFoundHandler(), ""
+    }
+    return
+}
+```
+
+在match方法中，`ServeMux` 的 `m` 字段是 `map[string]muxEntry`，`muxEntry` 存储了 `pattern` 和 `handler` 函数，因此通过迭代 `m` 寻找出注册路由的 `patten` 模式与实际 `url` 匹配的 `handler` 函数并返回。
+
+```go
+// Find a handler on a handler map given a path string.
+// Most-specific (longest) pattern wins.
+func (mux *ServeMux) match(path string) (h Handler, pattern string) {
+    // Check for exact match first.
+    v, ok := mux.m[path]
+    if ok {
+        return v.h, v.pattern
+    }
+
+    // Check for longest valid match.
+    var n = 0
+    for k, v := range mux.m {
+        if !pathMatch(k, path) {
+            continue
+        }
+        if h == nil || len(k) > n {
+            n = len(k)
+            h = v.h
+            pattern = v.pattern
+        }
+    }
+    return
+}
+```
+
+返回的结构一直传递到 `ServeMux` 的 `ServeHTTP` 方法，接下来调用用户注册的 `handler` 函数的ServeHTTP方法，即 `IndexHandler` 函数，在该函数内把response写到 `http.RequestWirter` 对象返回给客户端。
+
+上述函数运行结束即 `serverHandler{c.server}.ServeHTTP(w, w.req)` 运行结束。接下来就是对请求处理完毕之后上希望和连接断开的相关逻辑。
+
+至此，Golang中一个完整的http服务介绍完毕，包括注册路由，开启监听，处理连接，路由处理函数。
+
+### 总结
+
+多数的web应用基于HTTP协议，客户端和服务器通过request-response的方式交互。一个server并不可少的两部分莫过于路由注册和连接处理。Golang通过一个 `ServeMux` 实现了的 `multiplexer` 路由器来管理路由。同时提供一个Handler接口提供ServeHTTP用来实现 `handler` 处理器函数（上述示例为IndexHandler），后者可以处理实际request并构造response。
+
+`ServeMux` 和 `handler` 处理器函数 的连接桥梁就是Handler接口。`ServeMux` 的ServeHTTP方法实现了寻找注册路由的handler（IndexHandler）的函数，并调用该 `handler` 的 `ServeHTTP` 方法。ServeHTTP方法就是真正处理请求和构造响应的地方。
